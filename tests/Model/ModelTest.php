@@ -67,7 +67,7 @@ final class ModelTest extends TestCase
     {
         $fake = new FakeWordPress();
 
-        $model = new class([], $fake) extends Model {
+        $model = new class ([], $fake) extends Model {
             public function key(): string
             {
                 return 'admin_item';
@@ -101,7 +101,7 @@ final class ModelTest extends TestCase
     {
         $fake = new FakeWordPress();
 
-        $model = new class([], $fake) extends Model {
+        $model = new class ([], $fake) extends Model {
             public function key(): string
             {
                 return 'admin_override';
