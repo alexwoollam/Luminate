@@ -97,6 +97,45 @@ final class ModelTest extends TestCase
         $this->assertTrue($args['show_in_rest'] ?? false);
     }
 
+    public function testRegisterHonorsAdminDashboardOverrides(): void
+    {
+        $fake = new FakeWordPress();
+
+        $model = new class([], $fake) extends Model {
+            public function key(): string
+            {
+                return 'admin_override';
+            }
+
+            protected function labels(): array
+            {
+                return [
+                    'name' => 'Admin Overrides',
+                    'singular_name' => 'Admin Override',
+                ];
+            }
+
+            protected function admin(): array
+            {
+                return [
+                    'admin_dash' => true,
+                    'show_in_rest' => false,
+                    'menu_icon' => 'dashicons-admin-generic',
+                ];
+            }
+        };
+
+        $model->register();
+
+        $args = $fake->registeredPostTypes[0]['args'] ?? [];
+
+        $this->assertTrue($args['show_ui'] ?? false);
+        $this->assertTrue($args['show_in_menu'] ?? false);
+        $this->assertTrue($args['show_in_admin_bar'] ?? false);
+        $this->assertFalse($args['show_in_rest'] ?? true);
+        $this->assertSame('dashicons-admin-generic', $args['menu_icon'] ?? null);
+    }
+
     public function testSavePersistsNewModelViaSaveMethod(): void
     {
         $metaStore = [];
