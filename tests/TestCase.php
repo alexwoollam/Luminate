@@ -22,6 +22,7 @@ abstract class TestCase extends PHPUnitTestCase
         WordPressStub::fake('get_post', static fn (): ?object => null);
         WordPressStub::fake('get_posts', static fn (): array => []);
         WordPressStub::fake('wp_insert_post', static fn (): int => 0);
+        WordPressStub::fake('wp_update_post', static fn (): int => 0);
         WordPressStub::fake('wp_delete_post', static fn (): null => null);
 
         foreach (['Luminate\\Tests\\Model\\Book', 'Luminate\\Tests\\Model\\Author'] as $modelClass) {

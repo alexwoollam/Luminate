@@ -24,7 +24,9 @@ final class WordPressStub
     public static function call(string $function, array $arguments = []): mixed
     {
         if (!array_key_exists($function, self::$handlers)) {
+            // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
             throw new RuntimeException(sprintf('No stub has been registered for [%s].', $function));
+            // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
         }
 
         return (self::$handlers[$function])(...$arguments);

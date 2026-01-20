@@ -32,6 +32,13 @@ if (!function_exists('wp_insert_post')) {
     }
 }
 
+if (!function_exists('wp_update_post')) {
+    function wp_update_post(array $postarr, bool $wp_error = false): mixed
+    {
+        return WordPressStub::call('wp_update_post', [$postarr, $wp_error]);
+    }
+}
+
 if (!function_exists('get_post')) {
     function get_post(int $postId): ?object
     {

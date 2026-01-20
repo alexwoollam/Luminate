@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace Luminate;
 
 use Closure;
+use Luminate\Contracts\WordPress as WordPressContract;
 use Luminate\Model\Registry;
 use Luminate\Support\ServiceProvider;
+use Luminate\Support\WordPress;
 use RuntimeException;
 
 final class Kernel
@@ -29,6 +31,7 @@ final class Kernel
     public function __construct()
     {
         $this->singleton(Registry::class, static fn (): Registry => new Registry());
+        $this->singleton(WordPressContract::class, static fn (): WordPressContract => new WordPress());
     }
 
     public function bind(string $abstract, Closure $factory, bool $shared = false): void
@@ -56,7 +59,9 @@ final class Kernel
         }
 
         if (!array_key_exists($abstract, $this->bindings)) {
+            // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
             throw new RuntimeException(sprintf('Nothing bound to [%s].', $abstract));
+            // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
         }
 
         $object = ($this->bindings[$abstract]['factory'])($this);
@@ -84,5 +89,10 @@ final class Kernel
     public function models(): Registry
     {
         return $this->make(Registry::class);
+    }
+
+    public function wordpress(): WordPressContract
+    {
+        return $this->make(WordPressContract::class);
     }
 }

@@ -135,6 +135,22 @@ use DateTimeImmutable;
 
 Only keys declared in `fillable()` are stored; values are automatically cast according to their type definitions.
 
+Need to create a brand-new record without using `Book::create()`? Instantiate your model, `fill()` it, and call `save()`—Luminate automatically detects that the model doesn't exist yet and issues `wp_insert_post` alongside the fillable meta writes:
+
+```php
+$book = (new Book())
+    ->fill([
+        'title' => 'My Second Book',
+        'status' => 'draft',
+        'book_isbn' => '9780000000002',
+        'is_featured' => false,
+    ]);
+
+$book->save();
+```
+
+Datetime attributes declared as `TYPE_DATETIME` are hydrated into `DateTimeImmutable` instances, so comparisons stay consistent before and after you call `save()`/`refresh()`.
+
 `created_at` and `updated_at` meta keys are automatically added to the base fillable attributes and touched every time `save()` runs (override `usesTimestamps()` or the column names if you need something different). Dirty tracking ensures only changed attributes hit the database.
 
 ## Relationships
@@ -262,6 +278,75 @@ $count = Book::query()->featured()->count();
 
 Additional helpers include `findOrFail()`, `firstOrFail()`, `count()`, and `where()` for passing raw `get_posts` arguments when necessary.
 
+## WordPress integration
+
+Every model depends on the `Luminate\Contracts\WordPress` service to talk to core APIs. The default adapter calls the real WordPress functions, but you can inject your own implementation (for example, to mock network calls or proxy through another layer):
+
+```php
+use Acme\Infrastructure\CustomWordPress;
+
+$book = new Book([], new CustomWordPress());
+$book->register();
+```
+
+When booting via `Luminate::boot()`, the kernel automatically injects its shared WordPress service so hooks and registrars inherit the same adapter.
+
+## Admin dashboard integration
+
+Expose your custom post type in the WordPress admin menus by overriding `admin()` and enabling the `admin_dash` flag:
+
+```php
+protected function admin(): array
+{
+    return [
+        'admin_dash' => true,
+        'menu_icon' => 'dashicons-book',
+        'menu_position' => 20,
+    ];
+}
+```
+
+`admin_dash` maps to `show_ui`, `show_in_menu`, `show_in_admin_bar`, and `show_in_rest`. You can override any of those keys directly in the same array.
+
+## Customizing post attributes
+
+By default `title`, `slug`, `status`, `content`, and `excerpt` map directly to WordPress' built-in post columns. Override `postAttributeMap()` (and optionally `preparePostAttributeValue()`) to expose extra keys and control their serialization:
+
+```php
+protected function postAttributeMap(): array
+{
+    return [
+        ...parent::postAttributeMap(),
+        'menu_order' => 'menu_order',
+        'author' => 'post_author',
+    ];
+}
+
+protected function preparePostAttributeValue(string $attribute, mixed $value): mixed
+{
+    if ($attribute === 'author') {
+        return (int) $value;
+    }
+
+    return parent::preparePostAttributeValue($attribute, $value);
+}
+```
+
+These attributes participate in dirty tracking automatically, so subsequent `save()` calls trigger `wp_update_post` whenever you change them.
+
+## Localising admin columns
+
+Every fillable attribute automatically becomes an admin column. Override `textDomain()` when you want those column labels—even the generated "Yes"/"No" boolean text—to flow through WordPress' translation functions:
+
+```php
+protected function textDomain(): ?string
+{
+    return 'my-plugin';
+}
+```
+
+Column labels and values are escaped via `esc_html()` (with a graceful fallback outside of WordPress) before rendering, so user-supplied meta never leaks raw HTML into wp-admin.
+
 ## Development
 
 Run the Composer checks to validate metadata and autoloading:
@@ -275,3 +360,11 @@ Execute the automated test suite:
 ```bash
 composer test
 ```
+
+Adhere to PSR-12 by running the automated linter:
+
+```bash
+composer lint
+```
+
+This project ships with PHP_CodeSniffer (PSR-12 baseline) plus the WordPress coding standards dependencies so you can gradually enable additional WordPress-specific sniffs as needed (see `phpcs.xml`).

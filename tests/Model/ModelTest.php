@@ -4,9 +4,10 @@ declare(strict_types=1);
 
 namespace Luminate\Tests\Model;
 
-use Luminate\Model\Concerns\SoftDeletes;
+use DateTimeImmutable;
+use DateTimeInterface;
 use Luminate\Model\Model;
-use Luminate\Model\Query\Builder;
+use Luminate\Tests\Support\FakeWordPress;
 use Luminate\Tests\Support\WordPressStub;
 use Luminate\Tests\TestCase;
 
@@ -50,6 +51,97 @@ final class ModelTest extends TestCase
         $this->assertSame('1', $metaStore[101]['is_featured'] ?? null);
     }
 
+    public function testRegisterUsesInjectedWordPressService(): void
+    {
+        $fake = new FakeWordPress();
+        $book = new Book([], $fake);
+
+        $book->register();
+
+        $this->assertSame('book', $fake->registeredPostTypes[0]['post_type'] ?? null);
+        $this->assertNotEmpty($fake->filters);
+        $this->assertNotEmpty($fake->actions);
+    }
+
+    public function testRegisterIncludesAdminDashboardOptions(): void
+    {
+        $fake = new FakeWordPress();
+
+        $model = new class([], $fake) extends Model {
+            public function key(): string
+            {
+                return 'admin_item';
+            }
+
+            protected function labels(): array
+            {
+                return [
+                    'name' => 'Admin Items',
+                    'singular_name' => 'Admin Item',
+                ];
+            }
+
+            protected function admin(): array
+            {
+                return ['admin_dash' => true];
+            }
+        };
+
+        $model->register();
+
+        $args = $fake->registeredPostTypes[0]['args'] ?? [];
+
+        $this->assertTrue($args['show_ui'] ?? false);
+        $this->assertTrue($args['show_in_menu'] ?? false);
+        $this->assertTrue($args['show_in_admin_bar'] ?? false);
+        $this->assertTrue($args['show_in_rest'] ?? false);
+    }
+
+    public function testSavePersistsNewModelViaSaveMethod(): void
+    {
+        $metaStore = [];
+        $capturedPost = [];
+
+        WordPressStub::fake('wp_insert_post', function (array $data, bool $error) use (&$capturedPost): int {
+            $capturedPost = $data;
+
+            return 150;
+        });
+
+        WordPressStub::fake('update_post_meta', function (int $postId, string $key, mixed $value) use (&$metaStore): void {
+            $metaStore[$postId][$key] = $value;
+        });
+
+        WordPressStub::fake('get_post_meta', function (int $postId, string $key) use (&$metaStore): mixed {
+            return $metaStore[$postId][$key] ?? '';
+        });
+
+        WordPressStub::fake('get_post', static fn (int $postId): object => (object) [
+            'ID' => $postId,
+            'post_title' => 'Saved Title',
+            'post_status' => 'draft',
+            'post_name' => 'saved-title',
+        ]);
+
+        $book = new Book();
+        $book->fill([
+            'title' => 'My Saved Book',
+            'slug' => 'my-saved-book',
+            'status' => 'draft',
+            'book_isbn' => '9780000000011',
+            'is_featured' => false,
+        ]);
+
+        $book->save();
+
+        $this->assertSame(150, $book->id());
+        $this->assertSame('book', $capturedPost['post_type'] ?? null);
+        $this->assertSame('My Saved Book', $capturedPost['post_title'] ?? null);
+        $this->assertSame('draft', $capturedPost['post_status'] ?? null);
+        $this->assertSame('9780000000011', $metaStore[150]['book_isbn'] ?? null);
+        $this->assertSame('0', $metaStore[150]['is_featured'] ?? null);
+    }
+
     public function testSaveSkipsUnchangedAttributes(): void
     {
         $metaStore = [
@@ -85,6 +177,69 @@ final class ModelTest extends TestCase
         $this->assertTrue($book->is_featured);
         $this->assertContains('updated_at', $updatedFields);
         $this->assertNotContains('book_isbn', $updatedFields);
+    }
+
+    public function testSaveUpdatesPostAttributesAndMeta(): void
+    {
+        $metaStore = [
+            77 => [
+                'book_isbn' => '9780000000005',
+                'is_featured' => '0',
+            ],
+        ];
+
+        WordPressStub::fake('get_post_meta', function (int $postId, string $key) use (&$metaStore): mixed {
+            return $metaStore[$postId][$key] ?? '';
+        });
+
+        $posts = [
+            77 => (object) [
+                'ID' => 77,
+                'post_title' => 'Original Book',
+                'post_status' => 'publish',
+                'post_name' => 'original-book',
+            ],
+        ];
+
+        WordPressStub::fake('get_post', static fn (int $postId): ?object => $posts[$postId] ?? null);
+
+        $updatedPost = [];
+
+        WordPressStub::fake('wp_update_post', function (array $payload) use (&$updatedPost, &$posts): int {
+            $updatedPost = $payload;
+            $id = $payload['ID'];
+
+            if (!isset($posts[$id])) {
+                return $id;
+            }
+
+            foreach ($payload as $key => $value) {
+                if ($key === 'ID') {
+                    continue;
+                }
+
+                $posts[$id]->{$key} = $value;
+            }
+
+            return $id;
+        });
+
+        WordPressStub::fake('update_post_meta', function (int $postId, string $key, mixed $value) use (&$metaStore): void {
+            $metaStore[$postId][$key] = $value;
+        });
+
+        $book = (new Book())->newFromPost($posts[77]);
+
+        $book->fill([
+            'title' => 'Updated Title',
+            'book_isbn' => '9780000000006',
+        ]);
+
+        $book->save();
+
+        $this->assertSame('Updated Title', $updatedPost['post_title'] ?? null);
+        $this->assertSame('9780000000006', $metaStore[77]['book_isbn'] ?? null);
+        $this->assertArrayHasKey('updated_at', $metaStore[77]);
     }
 
     public function testRelationshipsCanBeLoadedAndEagerLoaded(): void
@@ -205,6 +360,43 @@ final class ModelTest extends TestCase
         Book::query()->findOrFail(999);
     }
 
+    public function testFindHonorsSoftDeleteFlags(): void
+    {
+        $post = (object) [
+            'ID' => 54,
+            'post_title' => 'Trashed Book',
+            'post_status' => 'publish',
+            'post_name' => 'trashed-book',
+        ];
+
+        WordPressStub::fake('get_post', static fn (int $postId): ?object => $postId === 54 ? $post : null);
+
+        $metaStore = [
+            54 => [
+                'book_isbn' => '9780000000015',
+                'deleted_at' => '2024-01-01T00:00:00+00:00',
+            ],
+        ];
+
+        WordPressStub::fake('get_post_meta', function (int $postId, string $key) use (&$metaStore): mixed {
+            return $metaStore[$postId][$key] ?? '';
+        });
+
+        $this->assertNull(Book::query()->find(54));
+
+        $withTrashed = Book::query()->withTrashed()->find(54);
+        $this->assertNotNull($withTrashed);
+        $this->assertTrue($withTrashed->trashed());
+
+        $onlyTrashed = Book::query()->onlyTrashed()->find(54);
+        $this->assertNotNull($onlyTrashed);
+        $this->assertTrue($onlyTrashed->trashed());
+
+        $metaStore[54]['deleted_at'] = '';
+
+        $this->assertNull(Book::query()->onlyTrashed()->find(54));
+    }
+
     public function testModelEventsFireInOrder(): void
     {
         Book::flushEventListeners();
@@ -317,72 +509,54 @@ final class ModelTest extends TestCase
         $this->assertFalse($book->trashed());
         $this->assertArrayNotHasKey('deleted_at', $metaStore[9]);
     }
-}
 
-final class Author extends Model
-{
-    public function key(): string
+    public function testDateTimeAttributesAreCastedToImmutable(): void
     {
-        return 'author';
-    }
-
-    protected function labels(): array
-    {
-        return [
-            'name' => 'Authors',
-            'singular_name' => 'Author',
+        $metaStore = [
+            31 => [
+                'book_isbn' => '9780000000020',
+                'deleted_at' => '2024-05-01T09:00:00+00:00',
+            ],
         ];
-    }
 
-    protected function fillable(): array
-    {
-        return [
-            'name' => self::TYPE_STRING,
+        WordPressStub::fake('get_post_meta', function (int $postId, string $key) use (&$metaStore): mixed {
+            return $metaStore[$postId][$key] ?? '';
+        });
+
+        $post = (object) [
+            'ID' => 31,
+            'post_title' => 'Dated Book',
+            'post_status' => 'publish',
+            'post_name' => 'dated-book',
         ];
+
+        $book = (new Book())->newFromPost($post);
+
+        $this->assertInstanceOf(DateTimeImmutable::class, $book->deleted_at);
+        $this->assertSame('2024-05-01T09:00:00+00:00', $book->deleted_at?->format(DateTimeInterface::ATOM));
     }
 
-    /**
-     * @return array<int, Book>
-     */
-    public function books(): array
+    public function testFillableColumnsEscapeOutput(): void
     {
-        return $this->hasMany(Book::class, 'author_id');
-    }
-}
+        WordPressStub::fake('get_post_meta', static fn (int $postId, string $key): string => '<script>alert(1)</script>');
 
-final class Book extends Model
-{
-    use SoftDeletes;
+        $capturedRenderer = null;
 
-    public function key(): string
-    {
-        return 'book';
-    }
+        WordPressStub::fake('add_action', function (string $hookName, callable $callback, int $priority = 10, int $acceptedArgs = 1) use (&$capturedRenderer): void {
+            if ($hookName === 'manage_book_posts_custom_column') {
+                $capturedRenderer = $callback;
+            }
+        });
 
-    protected function labels(): array
-    {
-        return [
-            'name' => 'Books',
-            'singular_name' => 'Book',
-        ];
-    }
+        $book = new Book();
+        $book->register();
 
-    protected function fillable(): array
-    {
-        return [
-            'book_isbn' => self::TYPE_STRING,
-            'is_featured' => self::TYPE_BOOL,
-            'author_id' => self::TYPE_INT,
-        ];
-    }
+        $this->assertIsCallable($capturedRenderer);
 
-    public function author(): ?Author
-    {
-        return $this->belongsTo(Author::class, 'author_id');
-    }
+        ob_start();
+        $capturedRenderer('book_isbn', 5);
+        $output = ob_get_clean();
 
-    public function scopeFeatured(Builder $query): Builder
-    {
-        return $query->whereMeta('is_featured', '1');
+        $this->assertSame('&lt;script&gt;alert(1)&lt;/script&gt;', trim((string) $output));
     }
 }

@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<ruleset name="Luminate Coding Standard">
+    <description>PSR-12 enforcement for Luminate.</description>
+
+    <file>src</file>
+    <file>tests</file>
+
+    <exclude-pattern>vendor</exclude-pattern>
+
+    <rule ref="PSR12">
+        <exclude name="Generic.Files.LineLength" />
+    </rule>
+</ruleset>

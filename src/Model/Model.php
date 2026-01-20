@@ -6,11 +6,14 @@ namespace Luminate\Model;
 
 use DateTimeImmutable;
 use DateTimeInterface;
+use Exception;
 use InvalidArgumentException;
 use Luminate\Contracts\Model as ModelContract;
+use Luminate\Contracts\WordPress as WordPressContract;
 use Luminate\Model\Column\CallbackColumn;
 use Luminate\Model\Column\Column;
 use Luminate\Model\Query\Builder;
+use Luminate\Support\WordPress as WordPressAdapter;
 use RuntimeException;
 
 abstract class Model implements ModelContract
@@ -46,8 +49,12 @@ abstract class Model implements ModelContract
 
     protected ?object $postObject = null;
 
-    public function __construct(array $attributes = [])
+    protected WordPressContract $wordpress;
+
+    public function __construct(array $attributes = [], ?WordPressContract $wordpress = null)
     {
+        $this->wordpress = $wordpress ?? new WordPressAdapter();
+
         if ($attributes !== []) {
             $this->fill($attributes);
         }
@@ -56,6 +63,16 @@ abstract class Model implements ModelContract
     public static function flushEventListeners(): void
     {
         unset(static::$eventListeners[static::class]);
+    }
+
+    public function setWordPress(WordPressContract $wordpress): void
+    {
+        $this->wordpress = $wordpress;
+    }
+
+    final public function wordpress(): WordPressContract
+    {
+        return $this->wordpress;
     }
 
     public static function creating(callable $callback): void
@@ -112,11 +129,7 @@ abstract class Model implements ModelContract
 
     final public function register(): void
     {
-        if (!function_exists('register_post_type')) {
-            throw new RuntimeException('register_post_type is not available.');
-        }
-
-        register_post_type($this->key(), $this->definition());
+        $this->wordpress->registerPostType($this->key(), $this->definition());
 
         $this->registerColumns();
     }
@@ -134,13 +147,19 @@ abstract class Model implements ModelContract
             return $builder->find($mode);
         }
 
-        return match ($mode) {
-            'first' => $builder->first($args),
-            'all', '' => $builder->all($args),
-            default => throw new InvalidArgumentException(
-                sprintf('Unsupported find mode [%s] for model [%s].', $mode, static::class)
-            ),
-        };
+        if (is_string($mode)) {
+            if ($mode === 'first') {
+                return $builder->first($args);
+            }
+
+            if ($mode === 'all' || $mode === '') {
+                return $builder->all($args);
+            }
+        }
+
+        // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
+        throw new InvalidArgumentException(sprintf('Unsupported find mode [%s] for model [%s].', (string) $mode, static::class));
+        // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
     }
 
     public static function query(): Builder
@@ -253,11 +272,11 @@ abstract class Model implements ModelContract
     {
         $id = $this->id();
 
-        if ($id === null || !function_exists('get_post')) {
+        if ($id === null) {
             return null;
         }
 
-        $post = get_post($id);
+        $post = $this->wordpress->getPost($id);
 
         if (!$post) {
             return null;
@@ -271,7 +290,9 @@ abstract class Model implements ModelContract
         $fresh = $this->fresh();
 
         if ($fresh === null) {
+            // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
             throw new RuntimeException(sprintf('Unable to refresh model [%s].', static::class));
+            // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
         }
 
         $this->setRawAttributes($fresh->toArray(), true);
@@ -282,10 +303,18 @@ abstract class Model implements ModelContract
 
     public function save(): void
     {
+        if (!$this->exists) {
+            $this->insert();
+
+            return;
+        }
+
         $postId = $this->id();
 
         if ($postId === null) {
+            // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
             throw new RuntimeException(sprintf('Cannot save model [%s] without an ID.', static::class));
+            // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
         }
 
         if ($this->fireModelEvent('saving') === false) {
@@ -300,13 +329,21 @@ abstract class Model implements ModelContract
             $this->touchTimestamps();
         }
 
-        $dirty = $this->gatherFillableAttributesForSaving();
+        $postAttributes = $this->gatherPostAttributesForSaving();
+        $metaAttributes = $this->gatherFillableAttributesForSaving();
 
-        if ($dirty === []) {
+        if ($postAttributes === [] && $metaAttributes === []) {
             return;
         }
 
-        $this->saveMeta($postId, $dirty);
+        if ($postAttributes !== []) {
+            $this->performUpdate($postId, $postAttributes);
+        }
+
+        if ($metaAttributes !== []) {
+            $this->saveMeta($postId, $metaAttributes);
+        }
+
         $this->syncOriginalAttributes();
         $this->refreshFromSource();
         $this->fireModelEvent('updated');
@@ -346,38 +383,54 @@ abstract class Model implements ModelContract
 
     protected function performInsert(): int
     {
-        if (!function_exists('wp_insert_post')) {
-            throw new RuntimeException('wp_insert_post is not available.');
-        }
-
-        $result = wp_insert_post($this->buildPostData(), true);
+        $result = $this->wordpress->wpInsertPost($this->buildPostData(), true);
 
         if (is_int($result)) {
             return $result;
         }
 
+        // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- exception message only
         $message = sprintf('Unable to insert model [%s].', static::class);
 
         if (is_object($result) && method_exists($result, 'get_error_message')) {
             $message .= ' ' . $result->get_error_message();
         }
 
+        // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
         throw new RuntimeException($message);
+        // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
+    }
+
+    protected function performUpdate(int $postId, array $attributes): void
+    {
+        $payload = array_merge(['ID' => $postId], $attributes);
+        $result = $this->wordpress->wpUpdatePost($payload, true);
+
+        if (is_int($result)) {
+            return;
+        }
+
+        // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- exception message only
+        $message = sprintf('Unable to update model [%s].', static::class);
+
+        if (is_object($result) && method_exists($result, 'get_error_message')) {
+            $message .= ' ' . $result->get_error_message();
+        }
+
+        // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
+        throw new RuntimeException($message);
+        // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
     }
 
     protected function performDelete(): void
     {
-        if (!function_exists('wp_delete_post')) {
-            throw new RuntimeException('wp_delete_post is not available.');
-        }
-
         $postId = $this->id();
 
         if ($postId === null) {
             return;
         }
 
-        wp_delete_post($postId, true);
+        $this->wordpress->wpDeletePost($postId, true);
     }
 
     /**
@@ -387,17 +440,23 @@ abstract class Model implements ModelContract
     {
         $data = [
             'post_type' => $this->key(),
-            'post_status' => $this->getAttribute('status') ?? $this->defaultPostStatus(),
-            'post_title' => (string) ($this->getAttribute('title') ?? ''),
-            'post_name' => $this->getAttribute('slug'),
-            'post_content' => (string) ($this->getAttribute('content') ?? ''),
-            'post_excerpt' => (string) ($this->getAttribute('excerpt') ?? ''),
         ];
 
-        return array_filter(
-            $data,
-            static fn ($value): bool => $value !== null
-        );
+        foreach ($this->postAttributeMap() as $attribute => $postKey) {
+            $value = $this->getAttribute($attribute);
+
+            if ($attribute === 'status' && $value === null) {
+                $value = $this->defaultPostStatus();
+            }
+
+            if ($value === null) {
+                continue;
+            }
+
+            $data[$postKey] = $this->preparePostAttributeValue($attribute, $value);
+        }
+
+        return $data;
     }
 
     protected function defaultPostStatus(): string
@@ -502,13 +561,43 @@ abstract class Model implements ModelContract
     }
 
     /**
+     * @return array<string, mixed>
+     */
+    protected function gatherPostAttributesForSaving(): array
+    {
+        $attributes = [];
+
+        foreach ($this->postAttributeMap() as $attribute => $postKey) {
+            if (!$this->isAttributeDirty($attribute)) {
+                continue;
+            }
+
+            $value = $this->getAttribute($attribute);
+
+            if ($attribute === 'status' && $value === null) {
+                $value = $this->defaultPostStatus();
+            }
+
+            if ($value === null) {
+                continue;
+            }
+
+            $attributes[$postKey] = $this->preparePostAttributeValue($attribute, $value);
+        }
+
+        return $attributes;
+    }
+
+    /**
      * @param array<int, string>|string $relations
      */
     public function load(array|string $relations): static
     {
         foreach ((array) $relations as $relation) {
             if (!method_exists($this, $relation)) {
+                // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
                 throw new RuntimeException(sprintf('Relation [%s] is not defined on [%s].', $relation, static::class));
+                // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
             }
 
             $this->setRelation($relation, $this->{$relation}());
@@ -545,10 +634,6 @@ abstract class Model implements ModelContract
      */
     final public function saveMeta(int $postId, array $attributes): void
     {
-        if (!function_exists('update_post_meta')) {
-            throw new RuntimeException('update_post_meta is not available.');
-        }
-
         foreach ($this->metaAttributes() as $field => $type) {
             if (!array_key_exists($field, $attributes)) {
                 continue;
@@ -557,16 +642,14 @@ abstract class Model implements ModelContract
             $rawValue = $attributes[$field];
 
             if ($rawValue === null) {
-                if (function_exists('delete_post_meta')) {
-                    delete_post_meta($postId, $field);
-                }
+                $this->wordpress->deletePostMeta($postId, $field);
 
                 continue;
             }
 
             $value = $this->prepareValueForStorage($rawValue, $type);
 
-            update_post_meta($postId, $field, $value);
+            $this->wordpress->updatePostMeta($postId, $field, $value);
         }
     }
 
@@ -580,6 +663,7 @@ abstract class Model implements ModelContract
                 'labels' => $this->labels(),
                 'supports' => $this->supports(),
             ],
+            $this->adminOptions(),
             $this->options()
         );
     }
@@ -603,6 +687,62 @@ abstract class Model implements ModelContract
     protected function options(): array
     {
         return [];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function admin(): array
+    {
+        return [];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function adminOptions(): array
+    {
+        $admin = $this->admin();
+        $options = [];
+
+        if (($admin['admin_dash'] ?? false) === true) {
+            $options = [
+                'show_ui' => true,
+                'show_in_menu' => true,
+                'show_in_admin_bar' => true,
+                'show_in_rest' => true,
+            ];
+        }
+
+        foreach (['show_ui', 'show_in_menu', 'show_in_admin_bar', 'show_in_nav_menus', 'show_in_rest', 'menu_position', 'menu_icon'] as $key) {
+            if (array_key_exists($key, $admin)) {
+                $options[$key] = $admin[$key];
+            }
+        }
+
+        return $options;
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    protected function postAttributeMap(): array
+    {
+        return [
+            'title' => 'post_title',
+            'slug' => 'post_name',
+            'status' => 'post_status',
+            'content' => 'post_content',
+            'excerpt' => 'post_excerpt',
+        ];
+    }
+
+    protected function preparePostAttributeValue(string $attribute, mixed $value): mixed
+    {
+        return match ($attribute) {
+            'title', 'slug', 'content', 'excerpt', 'status' => (string) $value,
+            default => $value,
+        };
     }
 
     /**
@@ -667,7 +807,7 @@ abstract class Model implements ModelContract
 
     protected function baseFillableAttributes(): array
     {
-        $base = ['id', 'title', 'slug', 'status', 'content', 'excerpt'];
+        $base = array_merge(['id'], array_keys($this->postAttributeMap()));
 
         if ($this->usesTimestamps()) {
             $base = [
@@ -680,7 +820,7 @@ abstract class Model implements ModelContract
             $base[] = $this->getDeletedAtColumn();
         }
 
-        return $base;
+        return array_values(array_unique($base));
     }
 
     protected function isFillableAttribute(string $key): bool
@@ -694,19 +834,23 @@ abstract class Model implements ModelContract
             return false;
         }
 
-        $current = $this->attributes[$key] ?? null;
-        $original = $this->original[$key] ?? null;
-
         if (!$this->exists) {
             return array_key_exists($key, $this->attributes);
         }
+
+        if (!array_key_exists($key, $this->original)) {
+            return array_key_exists($key, $this->attributes);
+        }
+
+        $current = $this->attributes[$key] ?? null;
+        $original = $this->original[$key];
 
         return $current != $original;
     }
 
     protected function newInstance(array $attributes = [], bool $exists = false, ?object $post = null): static
     {
-        $model = new static();
+        $model = new static([], $this->wordpress);
         $model->setRawAttributes($attributes, $exists);
         $model->postObject = $post;
 
@@ -823,46 +967,49 @@ abstract class Model implements ModelContract
             return;
         }
 
-        if (!function_exists('add_filter') || !function_exists('add_action')) {
-            return;
-        }
-
         $columnMap = [];
+        $columnLabels = [];
 
         foreach ($columns as $column) {
             $columnMap[$column->key()] = $column;
+            $columnLabels[$column->key()] = $this->sanitizeColumnLabel($column->label());
         }
 
         $postTypeKey = $this->key();
 
-        add_filter(
-            sprintf('manage_%s_posts_columns', $postTypeKey),
-            /**
-             * @param array<string, string> $existing
-             *
-             * @return array<string, string>
-             */
-            static function (array $existing) use ($columns): array {
-                foreach ($columns as $column) {
-                    $existing[$column->key()] = $column->label();
+        try {
+            $this->wordpress->addFilter(
+                sprintf('manage_%s_posts_columns', $postTypeKey),
+                /**
+                 * @param array<string, string> $existing
+                 *
+                 * @return array<string, string>
+                 */
+                static function (array $existing) use ($columnLabels): array {
+                    foreach ($columnLabels as $key => $label) {
+                        $existing[$key] = $label;
+                    }
+
+                    return $existing;
                 }
+            );
 
-                return $existing;
-            }
-        );
+            $this->wordpress->addAction(
+                sprintf('manage_%s_posts_custom_column', $postTypeKey),
+                static function (string $columnName, int $postId) use ($columnMap): void {
+                    if (!isset($columnMap[$columnName])) {
+                        return;
+                    }
 
-        add_action(
-            sprintf('manage_%s_posts_custom_column', $postTypeKey),
-            static function (string $columnName, int $postId) use ($columnMap): void {
-                if (!isset($columnMap[$columnName])) {
-                    return;
-                }
-
-                echo $columnMap[$columnName]->render($postId);
-            },
-            10,
-            2
-        );
+                    // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- renderer is responsible for escaping
+                    echo $columnMap[$columnName]->render($postId);
+                },
+                10,
+                2
+            );
+        } catch (RuntimeException) {
+            return;
+        }
     }
 
     /**
@@ -887,16 +1034,25 @@ abstract class Model implements ModelContract
 
     protected function columnLabel(string $field): string
     {
-        return ucwords(str_replace('_', ' ', $field));
+        $label = ucwords(str_replace('_', ' ', $field));
+        $domain = $this->textDomain();
+
+        if ($domain !== null && function_exists('__')) {
+            // phpcs:ignore WordPress.WP.I18n.NonSingularStringLiteralText,WordPress.WP.I18n.DomainNotLiteral -- dynamic labels derived from field names
+            return __($label, $domain);
+        }
+
+        return $label;
+    }
+
+    protected function textDomain(): ?string
+    {
+        return null;
     }
 
     protected function retrieveFillableValue(string $field, int $postId): mixed
     {
-        if (!function_exists('get_post_meta')) {
-            return null;
-        }
-
-        return get_post_meta($postId, $field, true);
+        return $this->wordpress->getPostMeta($postId, $field, true);
     }
 
     private function castValueFromStorage(mixed $value, string $type): mixed
@@ -908,7 +1064,7 @@ abstract class Model implements ModelContract
         return match ($type) {
             self::TYPE_BOOL => in_array($value, ['1', 1, true, 'true', 'yes', 'on'], true),
             self::TYPE_INT => (int) $value,
-            self::TYPE_DATETIME => (string) $value,
+            self::TYPE_DATETIME => $this->castDateTimeFromStorage($value),
             default => (string) $value,
         };
     }
@@ -943,6 +1099,25 @@ abstract class Model implements ModelContract
         return (string) $value;
     }
 
+    private function castDateTimeFromStorage(mixed $value): ?DateTimeImmutable
+    {
+        if ($value instanceof DateTimeInterface) {
+            return DateTimeImmutable::createFromInterface($value);
+        }
+
+        if (is_numeric($value)) {
+            $datetime = DateTimeImmutable::createFromFormat('U', (string) (int) $value);
+
+            return $datetime ?: null;
+        }
+
+        try {
+            return new DateTimeImmutable((string) $value);
+        } catch (Exception) {
+            return null;
+        }
+    }
+
     private function renderFillableColumn(string $field, string $type, int $postId): string
     {
         $value = $this->castValueFromStorage(
@@ -951,31 +1126,63 @@ abstract class Model implements ModelContract
         );
 
         if ($value === null || $value === '') {
-            return '—';
+            return $this->escapeColumnValue('—');
         }
 
-        return match ($type) {
+        $rendered = match ($type) {
             self::TYPE_BOOL => $this->formatBooleanValue($value),
             self::TYPE_INT => (string) $value,
             self::TYPE_DATETIME => $this->formatDateTimeValue($value),
             default => (string) $value,
         };
+
+        return $this->escapeColumnValue((string) $rendered);
+    }
+
+    private function sanitizeColumnLabel(string $label): string
+    {
+        if (function_exists('esc_html')) {
+            return esc_html($label);
+        }
+
+        return htmlspecialchars($label, ENT_QUOTES, 'UTF-8');
+    }
+
+    private function escapeColumnValue(string $value): string
+    {
+        if (function_exists('esc_html')) {
+            return esc_html($value);
+        }
+
+        return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
     }
 
     private function formatBooleanValue(mixed $value): string
     {
         $truthy = ['1', 1, true, 'true', 'yes', 'on'];
 
-        return in_array($value, $truthy, true) ? 'Yes' : 'No';
+        $label = in_array($value, $truthy, true) ? 'Yes' : 'No';
+        $domain = $this->textDomain();
+
+        if ($domain !== null && function_exists('__')) {
+            // phpcs:ignore WordPress.WP.I18n.NonSingularStringLiteralText,WordPress.WP.I18n.DomainNotLiteral -- boolean labels are dynamic
+            return __($label, $domain);
+        }
+
+        return $label;
     }
 
     private function formatDateTimeValue(mixed $value): string
     {
-        $timestamp = is_numeric($value)
-            ? (int) $value
-            : strtotime((string) $value);
+        if ($value instanceof DateTimeInterface) {
+            $timestamp = $value->getTimestamp();
+        } elseif (is_numeric($value)) {
+            $timestamp = (int) $value;
+        } else {
+            $timestamp = strtotime((string) $value) ?: null;
+        }
 
-        if (!$timestamp) {
+        if ($timestamp === null) {
             return (string) $value;
         }
 
@@ -1075,7 +1282,9 @@ abstract class Model implements ModelContract
         $instance = new $related();
 
         if (!$instance instanceof self) {
+            // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
             throw new RuntimeException(sprintf('Related class [%s] must extend %s.', $related, self::class));
+            // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
         }
 
         return $instance;

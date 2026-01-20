@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Luminate\Model\Query;
 
+use Luminate\Contracts\WordPress as WordPressContract;
 use Luminate\Model\Model;
 use RuntimeException;
 
@@ -28,10 +29,13 @@ final class Builder
 
     private bool $onlyTrashed = false;
 
+    private WordPressContract $wordpress;
+
     public function __construct(
         private readonly string $postType,
         private readonly Model $prototype
     ) {
+        $this->wordpress = $prototype->wordpress();
     }
 
     /**
@@ -148,17 +152,23 @@ final class Builder
 
     public function find(int $id): ?Model
     {
-        if (!function_exists('get_post')) {
-            throw new RuntimeException('get_post is not available.');
-        }
-
-        $post = get_post($id);
+        $post = $this->wordpress->getPost($id);
 
         if (!$post || (isset($post->post_type) && $post->post_type !== $this->postType)) {
             return null;
         }
 
         $model = $this->prototype->newFromPost($post);
+
+        if ($this->prototype->softDeletesEnabled()) {
+            if ($this->onlyTrashed && !$model->trashed()) {
+                return null;
+            }
+
+            if (!$this->includeTrashed && !$this->onlyTrashed && $model->trashed()) {
+                return null;
+            }
+        }
 
         if ($this->with !== []) {
             $model->load($this->with);
@@ -172,7 +182,9 @@ final class Builder
         $model = $this->find($id);
 
         if ($model === null) {
+            // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
             throw new RuntimeException(sprintf('Unable to find model [%s] with ID [%d].', $this->postType, $id));
+            // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
         }
 
         return $model;
@@ -191,13 +203,17 @@ final class Builder
             $result = $this->prototype->{$scope}($this, ...$arguments);
 
             if (!$result instanceof self) {
+                // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
                 throw new RuntimeException(sprintf('Scope [%s] must return a Builder instance.', $scope));
+                // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
             }
 
             return $result;
         }
 
+        // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
         throw new RuntimeException(sprintf('Call to undefined builder method [%s].', $method));
+        // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
     }
 
     /**
@@ -207,14 +223,10 @@ final class Builder
      */
     private function runQuery(array $args): array
     {
-        if (!function_exists('get_posts')) {
-            throw new RuntimeException('get_posts is not available.');
-        }
-
         $args = $this->buildQueryArgs($args);
 
         /** @var array<int, object> $posts */
-        $posts = get_posts($args);
+        $posts = $this->wordpress->getPosts($args);
 
         $models = array_map(
             fn (object $post): Model => $this->prototype->newFromPost($post),
