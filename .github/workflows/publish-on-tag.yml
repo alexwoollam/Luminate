@@ -1,0 +1,22 @@
+name: Publish on tag
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Do your build
+        run: |
+          echo "Tag is $GITHUB_REF_NAME"
+          echo "Build and publish here"
